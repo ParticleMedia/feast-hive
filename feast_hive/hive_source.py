@@ -5,6 +5,10 @@ from feast import RepoConfig, ValueType
 from feast.data_source import DataSource
 from feast.errors import DataSourceNotFoundException
 from feast.protos.feast.core.DataSource_pb2 import DataSource as DataSourceProto
+from feast.protos.feast.core.SavedDataset_pb2 import (
+    SavedDatasetStorage as SavedDatasetStorageProto,
+)
+from feast.saved_dataset import SavedDatasetStorage
 from feast_hive.hive_type_map import hive_to_feast_value_type
 
 
@@ -80,6 +84,7 @@ class HiveOptions:
 class HiveSource(DataSource):
     def __init__(
         self,
+        name: Optional[str] = "",
         table: Optional[str] = None,
         query: Optional[str] = None,
         event_timestamp_column: Optional[str] = "",
@@ -91,14 +96,21 @@ class HiveSource(DataSource):
             table is not None or query is not None
         ), '"table" or "query" is required for HiveSource.'
 
+
         super().__init__(
-            event_timestamp_column,
-            created_timestamp_column,
-            field_mapping,
-            date_partition_column,
+            name=name,
+            event_timestamp_column=event_timestamp_column,
+            created_timestamp_column=created_timestamp_column,
+            field_mapping=field_mapping,
+            date_partition_column=date_partition_column,
         )
 
         self._hive_options = HiveOptions(table=table, query=query)
+        self.event_timestamp_column = event_timestamp_column
+
+    # Note: Python requires redefining hash in child classes that override __eq__
+    def __hash__(self):
+        return super().__hash__()
 
     def __eq__(self, other):
         if not isinstance(other, HiveSource):
@@ -142,7 +154,7 @@ class HiveSource(DataSource):
             custom_options=self.hive_options.to_proto(),
         )
 
-        data_source_proto.event_timestamp_column = self.event_timestamp_column
+        data_source_proto.timestamp_field = self.timestamp_field
         data_source_proto.created_timestamp_column = self.created_timestamp_column
         data_source_proto.date_partition_column = self.date_partition_column
         return data_source_proto
@@ -158,7 +170,7 @@ class HiveSource(DataSource):
             field_mapping=dict(data_source.field_mapping),
             table=hive_options.table,
             query=hive_options.query,
-            event_timestamp_column=data_source.event_timestamp_column,
+            event_timestamp_column=data_source.timestamp_field,
             created_timestamp_column=data_source.created_timestamp_column,
             date_partition_column=data_source.date_partition_column,
         )
@@ -207,3 +219,29 @@ class HiveSource(DataSource):
                         return [(field[0], field[1]) for field in cursor.description]
                     except HiveServer2Error:
                         raise DataSourceNotFoundException(self.query)
+
+
+class SavedDatasetHiveStorage(SavedDatasetStorage):
+    _proto_attr_name = "hive_storage"
+
+    hive_options: HiveOptions
+
+    def __init__(self, table_ref: str):
+        self.hive_options = HiveOptions(
+            table=table_ref, schema=None, query=None, database=None
+        )
+
+    @staticmethod
+    def from_proto(storage_proto: SavedDatasetStorageProto) -> SavedDatasetStorage:
+
+        return SavedDatasetHiveStorage(
+            table_ref=HiveOptions.from_proto(storage_proto.hive_storage).table
+        )
+
+    def to_proto(self) -> SavedDatasetStorageProto:
+        return SavedDatasetStorageProto(
+            hive_storage=self.hive_options.to_proto()
+        )
+
+    def to_data_source(self) -> DataSource:
+        return HiveSource(table=self.hive_options.table)

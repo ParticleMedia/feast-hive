@@ -15,12 +15,21 @@ from feast.data_source import DataSource
 from feast.errors import InvalidEntityType
 from feast.feature_view import DUMMY_ENTITY_ID, DUMMY_ENTITY_VAL
 from feast.infra.offline_stores import offline_utils
-from feast.infra.offline_stores.offline_store import OfflineStore, RetrievalJob
+from feast.infra.offline_stores.offline_store import (
+    OfflineStore,
+    RetrievalJob,
+    RetrievalMetadata,
+)
+from feast_hive.hive_source import (
+    SavedDatasetHiveStorage,
+)
 from feast.on_demand_feature_view import OnDemandFeatureView
 from feast.registry import Registry
 from feast.repo_config import FeastConfigBaseModel, RepoConfig
 from feast_hive.hive_source import HiveSource
 from feast_hive.hive_type_map import hive_to_pa_value_type, pa_to_hive_value_type
+from feast.saved_dataset import SavedDatasetStorage
+
 
 try:
     from impala.dbapi import connect as impala_connect
@@ -88,12 +97,6 @@ class HiveOfflineStoreConfig(FeastConfigBaseModel):
     kerberos_service_name: StrictStr = "impala"
     """ Specify particular impalad service principal. """
 
-    use_http_transport: StrictBool = False
-    """ Use http transport mode """
-
-    http_path: StrictStr = ""
-    """ Path of URL endpoint when use http transport mode """
-
     def __init__(self, **data: Any):
         if "hive_conf" not in data:
             data["hive_conf"] = DEFAULT_HIVE_CONF.copy()
@@ -146,7 +149,7 @@ class HiveOfflineStore(OfflineStore):
         data_source: DataSource,
         join_key_columns: List[str],
         feature_name_columns: List[str],
-        event_timestamp_column: str,
+        timestamp_field: str,
         created_timestamp_column: Optional[str],
         start_date: datetime,
         end_date: datetime,
@@ -161,7 +164,7 @@ class HiveOfflineStore(OfflineStore):
             partition_by_join_key_string = (
                 "PARTITION BY " + partition_by_join_key_string
             )
-        timestamps = [event_timestamp_column]
+        timestamps = [timestamp_field]
         if created_timestamp_column:
             timestamps.append(created_timestamp_column)
         timestamp_desc_string = " DESC, ".join(timestamps) + " DESC"
@@ -180,10 +183,54 @@ class HiveOfflineStore(OfflineStore):
                 SELECT {field_string},
                 ROW_NUMBER() OVER({partition_by_join_key_string} ORDER BY {timestamp_desc_string}) AS feast_row_
                 FROM {from_expression} t1
-                WHERE {event_timestamp_column} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
+                WHERE {timestamp_field} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}')
             ) t2
             WHERE feast_row_ = 1
             """,
+        ]
+
+        conn = HiveConnection(config.offline_store)
+        return HiveRetrievalJob(conn, queries)
+
+    @staticmethod
+    def pull_all_from_table_or_query(
+            config: RepoConfig,
+            data_source: DataSource,
+            join_key_columns: List[str],
+            feature_name_columns: List[str],
+            timestamp_field: str,
+            created_timestamp_column: Optional[str],
+            start_date: datetime,
+            end_date: datetime,
+    ) -> RetrievalJob:
+        assert isinstance(config.offline_store, HiveOfflineStoreConfig)
+        assert isinstance(data_source, HiveSource)
+
+        from_expression = data_source.get_table_query_string()
+
+        partition_by_join_key_string = ", ".join(join_key_columns)
+        if partition_by_join_key_string != "":
+            partition_by_join_key_string = (
+                    "PARTITION BY " + partition_by_join_key_string
+            )
+        timestamps = [timestamp_field]
+        if created_timestamp_column:
+            timestamps.append(created_timestamp_column)
+        timestamp_desc_string = " DESC, ".join(timestamps) + " DESC"
+        field_string = ", ".join(join_key_columns + feature_name_columns + timestamps)
+
+        start_date = _format_datetime(start_date)
+        end_date = _format_datetime(end_date)
+
+        queries = [
+            "SET hive.resultset.use.unique.column.names=false",
+            f"""
+                SELECT 
+                    {field_string}
+                    {f", {repr(DUMMY_ENTITY_VAL)} AS {DUMMY_ENTITY_ID}" if not join_key_columns else ""}
+                FROM {from_expression}
+                WHERE {timestamp_field} BETWEEN TIMESTAMP('{start_date}') AND TIMESTAMP('{end_date}'
+                """,
         ]
 
         conn = HiveConnection(config.offline_store)
@@ -276,6 +323,7 @@ class HiveRetrievalJob(RetrievalJob):
         queries: Union[str, List[str], Callable[[], ContextManager[List[str]]]],
         full_feature_names: bool = False,
         on_demand_feature_views: Optional[List[OnDemandFeatureView]] = None,
+        metadata: Optional[RetrievalMetadata] = None,
     ):
         assert (
             isinstance(queries, str) or isinstance(queries, list) or callable(queries)
@@ -301,6 +349,7 @@ class HiveRetrievalJob(RetrievalJob):
         self._conn = conn
         self._full_feature_names = full_feature_names
         self._on_demand_feature_views = on_demand_feature_views
+        self._metadata = metadata
 
     @property
     def full_feature_names(self) -> bool:
@@ -315,9 +364,17 @@ class HiveRetrievalJob(RetrievalJob):
 
     def _to_arrow_internal(self) -> pa.Table:
         with self._queries_generator() as queries:
+            # queries = [
+            #             '''select * from dev.driver_stats''',
+            #             '''show tables''',]
             with self._conn.cursor() as cursor:
                 for query in queries:
+                    print("Processing query:\n")
+                    print(query)
                     cursor.execute(query)
+                    # if query.strip().startswith('select'):
+                    #     batches = cursor.fetchcolumnar()
+                    print('=============================================')
                 batches = cursor.fetchcolumnar()
                 schema = pa.schema(
                     [
@@ -351,6 +408,49 @@ class HiveRetrievalJob(RetrievalJob):
                 values[i] = None
         return values
 
+    # @log_exceptions_and_usage
+    def to_hive(self, table_name: str) -> None:
+        """Save dataset as a new Hive table"""
+        if self.on_demand_feature_views:
+            transformed_df = self.to_df()
+            _upload_entity_df_by_insert(
+                conn,
+                table_name,
+                transformed_df,
+                # TODO hook it up
+                10000,)
+            return
+
+        with self._query_generator() as query:
+            query = f'CREATE TABLE "{table_name}" AS ({query});\n'
+
+            with conn.cursor() as cursor:
+                # Create Hive temporary table according to entity_df schema
+                # TODO change path
+                create_entity_table_sql = f"""
+                    CREATE TABLE {table_name} (
+                      {', '.join([f'{col_name} {col_type}' for col_name, col_type in hive_schema])}
+                    )
+                    ROW FORMAT SERDE 
+	                    'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe' 
+	                STORED AS INPUTFORMAT 
+	                    'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat' 
+	                OUTPUTFORMAT 
+	                    'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+	                LOCATION
+	                    's3://user-devs/ricky/feast_data/ {table_name}'
+                    """
+                cursor.execute(create_entity_table_sql)
+
+    def persist(self, storage: SavedDatasetStorage):
+        assert isinstance(storage, SavedDatasetHiveStorage)
+        self.to_hive(table_name=storage.hive_options.table)
+
+
+    @property
+    def metadata(self) -> Optional[RetrievalMetadata]:
+        return self._metadata
+
 
 def _format_datetime(t: datetime):
     # Since Hive does not support timezone, need to transform to utc.
@@ -377,7 +477,16 @@ def _upload_entity_df_and_get_entity_schema(
     elif isinstance(entity_df, str):
         with conn.cursor() as cursor:
             cursor.execute(
-                f"CREATE TABLE {table_name} STORED AS PARQUET AS {entity_df}"
+                f"""CREATE TABLE {table_name} 
+                 ROW FORMAT SERDE 
+	                'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe' 
+	            STORED AS INPUTFORMAT 
+	                'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat' 
+	            OUTPUTFORMAT 
+	                'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+	            LOCATION
+	             's3://user-devs/ricky/feast_data/ {table_name}'
+                 AS {entity_df}"""
             )
         limited_entity_df = HiveRetrievalJob(
             conn,
@@ -410,12 +519,23 @@ def _upload_entity_df_by_insert(
 
     with conn.cursor() as cursor:
         # Create Hive temporary table according to entity_df schema
+        # TODO change s3 path.
         create_entity_table_sql = f"""
             CREATE TABLE {table_name} (
               {', '.join([f'{col_name} {col_type}' for col_name, col_type in hive_schema])}
             )
-            STORED AS PARQUET
+            ROW FORMAT SERDE 
+	            'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe' 
+	        STORED AS INPUTFORMAT 
+	            'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat' 
+	        OUTPUTFORMAT 
+	            'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+	        LOCATION
+	             's3://user-devs/ricky/feast_data/{table_name}'
             """
+
+        print('Create temp entity table:\n')
+        print(create_entity_table_sql)
         cursor.execute(create_entity_table_sql)
 
         def preprocess_value(raw_value, col_type):
@@ -439,6 +559,9 @@ def _upload_entity_df_by_insert(
         # Upload entity_df to the Hive table by multiple rows insert method
         entity_count = len(pa_table)
         chunk_size = entity_count if chunk_size is None else chunk_size
+
+        print("Total size:", entity_count, " chuck size:", chunk_size)
+
         pa_batches = pa_table.to_batches(chunk_size)
         if len(pa_batches) > 1:
             # fix this hive bug: https://issues.apache.org/jira/browse/HIVE-19316
@@ -457,6 +580,8 @@ def _upload_entity_df_by_insert(
                 INSERT INTO TABLE {table_name}
                 VALUES ({'), ('.join([', '.join(chunk_row) for chunk_row in chunk_data])})
             """
+            print('Insert sql:\n')
+            print(entity_chunk_insert_sql)
             cursor.execute(entity_chunk_insert_sql)
 
 
@@ -563,9 +688,9 @@ WITH {{ featureview.name }}__entity_dataframe AS (
 
  1. We first join the current feature_view to the entity dataframe that has been passed.
  This JOIN has the following logic:
-    - For each row of the entity dataframe, only keep the rows where the `event_timestamp_column`
+    - For each row of the entity dataframe, only keep the rows where the `timestamp_field`
     is less than the one provided in the entity dataframe
-    - If there a TTL for the current feature_view, also keep the rows where the `event_timestamp_column`
+    - If there a TTL for the current feature_view, also keep the rows where the `timestamp_field`
     is higher the the one provided minus the TTL
     - For each row, Join on the entity key and retrieve the `entity_row_unique_id` that has been
     computed previously
@@ -576,7 +701,7 @@ WITH {{ featureview.name }}__entity_dataframe AS (
 
 {{ featureview.name }}__subquery AS (
     SELECT
-        {{ featureview.event_timestamp_column }} as event_timestamp,
+        {{ featureview.timestamp_field }} as event_timestamp,
         {{ featureview.created_timestamp_column ~ ' as created_timestamp,' if featureview.created_timestamp_column else '' }}
         {{ featureview.entity_selections | join(', ')}}{% if featureview.entity_selections %},{% else %}{% endif %}
         {% for feature in featureview.features %}
@@ -591,9 +716,9 @@ WITH {{ featureview.name }}__entity_dataframe AS (
         FROM entity_dataframe
     ) AS temp
     ON (
-        {{ featureview.event_timestamp_column }} <= max_entity_timestamp_
+        {{ featureview.timestamp_field }} <= max_entity_timestamp_
         {% if featureview.ttl == 0 %}{% else %}
-        AND {{ featureview.event_timestamp_column }} >=  min_entity_timestamp_
+        AND {{ featureview.timestamp_field }} >=  min_entity_timestamp_
         {% endif %}
     )
 )
